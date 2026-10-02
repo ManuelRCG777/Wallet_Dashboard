@@ -4,7 +4,7 @@ A full-stack, multi-chain crypto portfolio tracker. Add any wallet address — h
 
 **Live demo:** [wallet-dashboard-ten.vercel.app](https://wallet-dashboard-ten.vercel.app)
 
-![Dashboard overview](Dashboardscreenshot.png)
+![Dashboard overview](Dashboardscreenshot.jpg)
 ---
 
 ## Features
