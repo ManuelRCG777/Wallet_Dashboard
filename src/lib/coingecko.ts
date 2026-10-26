@@ -42,18 +42,26 @@ export async function getCoinPrices(ids: string[]): Promise<Record<string, CgPri
   return cgFetch<Record<string, CgPrice>>(path);
 }
 
+// The free CoinGecko API only accepts ONE contract address per request
+// (asking for more returns HTTP 400), so tokens are queried one at a time.
+// Only use this as a fallback for a few tokens that DexScreener couldn't price.
 export async function getTokenPricesByContract(
   platform: string,
-  addresses: string[]
+  addresses: string[],
+  maxRequests = 5
 ): Promise<Record<string, CgPrice>> {
-  if (!addresses.length) return {};
-  const addrs = addresses.map(a => a.toLowerCase()).join(',');
-  const path = `/simple/token_price/${platform}?contract_addresses=${addrs}&vs_currencies=usd,eur&include_24hr_change=true`;
-  try {
-    return await cgFetch<Record<string, CgPrice>>(path);
-  } catch {
-    return {};
+  const out: Record<string, CgPrice> = {};
+  const unique = [...new Set(addresses.map(a => a.toLowerCase()))].slice(0, maxRequests);
+  for (const addr of unique) {
+    const path = `/simple/token_price/${platform}?contract_addresses=${addr}&vs_currencies=usd,eur&include_24hr_change=true`;
+    try {
+      const data = await cgFetch<Record<string, CgPrice>>(path, 0);
+      if (data[addr]) out[addr] = data[addr];
+    } catch {
+      // unknown token or rate limit — skip
+    }
   }
+  return out;
 }
 
 export async function searchCoin(query: string): Promise<{ id: string; symbol: string; name: string }[]> {
