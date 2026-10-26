@@ -1,7 +1,8 @@
 // Alchemy EVM support for all non-Solana, non-Tron chains.
-// Covers: Ethereum, Base, BNB, Polygon, Arbitrum, Optimism, Avalanche.
+// Covers: BNB, Polygon, Arbitrum, Optimism, Avalanche, Robinhood Chain.
 
 import { Chain } from '@/types';
+import { getDexTokens } from '@/lib/dexscreener';
 
 const KEY = process.env.ALCHEMY_API_KEY || '';
 
@@ -137,50 +138,80 @@ export function isAlchemyAvailable(chain: Chain): boolean {
   return !!KEY && !!ALCHEMY_RPCS[chain];
 }
 
+// Limits for the token pipeline (keeps us inside Vercel's timeout budget)
+const MAX_BALANCE_PAGES = 10;      // up to ~1000 tokens from alchemy_getTokenBalances
+const MAX_PRICED_TOKENS = 60;      // tokens with a DexScreener price → always get metadata
+const MAX_UNPRICED_TOKENS = 20;    // a few unpriced ones, so CoinGecko can still try them
+
+const ZERO_BALANCE = '0x0000000000000000000000000000000000000000000000000000000000000000';
+
+// Step 1: read EVERY page of balances (cheap — balances only, no metadata).
+async function getAllRawBalances(alchemyUrl: string, walletAddress: string) {
+  const all: Array<{ contractAddress: string; tokenBalance: string }> = [];
+  let pageKey: string | undefined;
+  for (let page = 0; page < MAX_BALANCE_PAGES; page++) {
+    const params: unknown[] = pageKey
+      ? [walletAddress, 'erc20', { pageKey }]
+      : [walletAddress, 'erc20'];
+    const res = await rpcCall(alchemyUrl, 'alchemy_getTokenBalances', params, 10000) as {
+      tokenBalances?: Array<{ contractAddress: string; tokenBalance: string }>;
+      pageKey?: string;
+    };
+    if (!res?.tokenBalances) break;
+    all.push(...res.tokenBalances);
+    if (!res.pageKey) break;
+    pageKey = res.pageKey;
+  }
+  return all.filter(t => t.tokenBalance && t.tokenBalance !== ZERO_BALANCE && t.tokenBalance !== '0x');
+}
+
 export async function getAlchemyTokenBalances(chain: Chain, walletAddress: string): Promise<AlchemyTokenBalance[]> {
   const alchemyUrl = ALCHEMY_RPCS[chain];
 
   if (alchemyUrl) {
     try {
-      const res = await rpcCall(alchemyUrl, 'alchemy_getTokenBalances', [walletAddress]) as {
-        tokenBalances: Array<{ contractAddress: string; tokenBalance: string }>;
-      };
-      if (res?.tokenBalances?.length) {
-        const nonZero = res.tokenBalances
-          .filter(t => t.tokenBalance && t.tokenBalance !== '0x0000000000000000000000000000000000000000000000000000000000000000')
-          .slice(0, 100); // cap at 100 tokens to stay within Vercel's timeout budget
-        if (nonZero.length) {
-          const results: AlchemyTokenBalance[] = [];
-          const CHUNK = 15;
-          for (let i = 0; i < nonZero.length; i += CHUNK) {
-            const chunk = nonZero.slice(i, i + CHUNK);
-            const metas = await Promise.all(
-              chunk.map(async t => {
-                try {
-                  const meta = await rpcCall(alchemyUrl, 'alchemy_getTokenMetadata', [t.contractAddress]) as {
-                    decimals: number; name: string; symbol: string;
-                  };
-                  const balance = BigInt(t.tokenBalance);
-                  if (balance <= 0n) return null;
-                  return {
-                    contractAddress: t.contractAddress.toLowerCase(),
-                    contractAddressOriginal: t.contractAddress,
-                    symbol: meta?.symbol ?? t.contractAddress.slice(0, 6),
-                    name: meta?.name ?? 'Unknown Token',
-                    decimals: meta?.decimals ?? 18,
-                    balance,
-                  } satisfies AlchemyTokenBalance;
-                } catch { return null; }
-              })
-            );
-            results.push(...(metas.filter(Boolean) as AlchemyTokenBalance[]));
-            if (i + CHUNK < nonZero.length) await new Promise(r => setTimeout(r, 50));
-          }
-          if (results.length > 0) return results;
-        }
+      const nonZero = await getAllRawBalances(alchemyUrl, walletAddress);
+      if (!nonZero.length) return []; // Alchemy responded, wallet has no tokens (authoritative)
+
+      // Step 2: ask DexScreener which of these tokens actually trade (have a price).
+      // Spam airdrops have no liquidity, so they drop to the back of the queue.
+      const dex = await getDexTokens(nonZero.map(t => t.contractAddress.toLowerCase()), chain);
+      const priced   = nonZero.filter(t =>  (dex.get(t.contractAddress.toLowerCase())?.priceUsd ?? 0) > 0);
+      const unpriced = nonZero.filter(t => !((dex.get(t.contractAddress.toLowerCase())?.priceUsd ?? 0) > 0));
+      const selected = [
+        ...priced.slice(0, MAX_PRICED_TOKENS),
+        ...unpriced.slice(0, MAX_UNPRICED_TOKENS),
+      ];
+
+      // Step 3: fetch name/symbol/decimals only for the selected tokens.
+      const results: AlchemyTokenBalance[] = [];
+      const CHUNK = 15;
+      for (let i = 0; i < selected.length; i += CHUNK) {
+        const chunk = selected.slice(i, i + CHUNK);
+        const metas = await Promise.all(
+          chunk.map(async t => {
+            try {
+              const balance = BigInt(t.tokenBalance);
+              if (balance <= 0n) return null;
+              const meta = await rpcCall(alchemyUrl, 'alchemy_getTokenMetadata', [t.contractAddress]) as {
+                decimals: number | null; name: string | null; symbol: string | null;
+              };
+              const d = dex.get(t.contractAddress.toLowerCase());
+              return {
+                contractAddress: t.contractAddress.toLowerCase(),
+                contractAddressOriginal: t.contractAddress,
+                symbol: meta?.symbol || d?.symbol || t.contractAddress.slice(0, 6),
+                name: meta?.name || d?.name || 'Unknown Token',
+                decimals: meta?.decimals ?? 18,
+                balance,
+              } satisfies AlchemyTokenBalance;
+            } catch { return null; }
+          })
+        );
+        results.push(...(metas.filter(Boolean) as AlchemyTokenBalance[]));
+        if (i + CHUNK < selected.length) await new Promise(r => setTimeout(r, 50));
       }
-      // Alchemy responded but wallet has 0 tokens — return empty (authoritative)
-      return [];
+      return results;
     } catch (err) {
       console.error(`[alchemyEvm/${chain}] alchemy_getTokenBalances failed:`, err instanceof Error ? err.message : err);
     }
