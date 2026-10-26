@@ -201,25 +201,24 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // ── 5. CoinGecko token prices (supplement / override DexScreener) ────────
+    // ── 5. CoinGecko fallback for tokens DexScreener couldn't price ──────────
+    // Free CoinGecko = 1 address per request, so only a handful per chain.
     const uniqueTokenChains = [...new Set(allTokens.map(t => t.chain))];
-    for (const chain of uniqueTokenChains) {
-      const addrs = allTokens.filter(t => t.chain === chain).map(t => t.contractAddress);
-      if (!addrs.length) continue;
+    await Promise.all(uniqueTokenChains.map(async chain => {
+      const unpriced = allTokens.filter(t => t.chain === chain && !(t.usdPrice > 0));
+      if (!unpriced.length) return;
       const platform = CHAIN_CONFIG[chain].coingeckoPlatform;
-      try {
-        const prices = await getTokenPricesByContract(platform, addrs);
-        for (const token of allTokens.filter(t => t.chain === chain)) {
-          const p = prices[token.contractAddress.toLowerCase()];
-          if (!p) continue;
-          token.usdPrice = p.usd || token.usdPrice;
-          token.eurPrice = p.eur || token.eurPrice;
-          token.usdValue = token.balance * token.usdPrice;
-          token.eurValue = token.balance * token.eurPrice;
-          token.change24h = p.usd_24h_change ?? token.change24h;
-        }
-      } catch {}
-    }
+      const prices = await getTokenPricesByContract(platform, unpriced.map(t => t.contractAddress));
+      for (const token of unpriced) {
+        const p = prices[token.contractAddress.toLowerCase()];
+        if (!p?.usd) continue;
+        token.usdPrice = p.usd;
+        token.eurPrice = p.eur || p.usd * eurUsdRate;
+        token.usdValue = token.balance * token.usdPrice;
+        token.eurValue = token.balance * token.eurPrice;
+        token.change24h = p.usd_24h_change ?? token.change24h;
+      }
+    }));
 
     // ── 5b. Hide dust and unpriced spam ──────────────────────────────────────
     const visibleTokens = allTokens.filter(t => t.usdValue >= MIN_TOKEN_USD);
