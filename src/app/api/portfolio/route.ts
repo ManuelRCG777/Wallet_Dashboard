@@ -9,6 +9,9 @@ import { getCoinPrices, getTokenPricesByContract, CgPrice } from '@/lib/coingeck
 import { getDexTokens } from '@/lib/dexscreener';
 import { getJupiterTokenMap } from '@/lib/jupiterTokens';
 
+// Token positions worth less than this (in USD) are treated as dust/airdrop spam and hidden.
+const MIN_TOKEN_USD = 5;
+
 function evmLogoUrl(chain: Chain, checksumAddress: string): string {
   const twChain: Partial<Record<Chain, string>> = {
     ethereum: 'ethereum',
@@ -218,15 +221,18 @@ export async function POST(req: NextRequest) {
       } catch {}
     }
 
+    // ── 5b. Hide dust and unpriced spam ──────────────────────────────────────
+    const visibleTokens = allTokens.filter(t => t.usdValue >= MIN_TOKEN_USD);
+
     // ── 6. Portfolio totals ──────────────────────────────────────────────────
     const totalNativeUsd = nativeBalances.reduce((s, b) => s + b.usdValue, 0);
     const totalNativeEur = nativeBalances.reduce((s, b) => s + b.eurValue, 0);
-    const totalTokenUsd = allTokens.reduce((s, t) => s + t.usdValue, 0);
-    const totalTokenEur = allTokens.reduce((s, t) => s + t.eurValue, 0);
+    const totalTokenUsd = visibleTokens.reduce((s, t) => s + t.usdValue, 0);
+    const totalTokenEur = visibleTokens.reduce((s, t) => s + t.eurValue, 0);
     const totalUsd = totalNativeUsd + totalTokenUsd;
     const totalEur = totalNativeEur + totalTokenEur;
 
-    for (const token of allTokens) {
+    for (const token of visibleTokens) {
       token.portfolioPercent = totalUsd > 0 ? (token.usdValue / totalUsd) * 100 : 0;
     }
 
@@ -234,7 +240,7 @@ export async function POST(req: NextRequest) {
     if (totalUsd > 0) {
       const allItems = [
         ...nativeBalances.map(b => ({ usdValue: b.usdValue, change24h: b.change24h })),
-        ...allTokens.map(t => ({ usdValue: t.usdValue, change24h: t.change24h })),
+        ...visibleTokens.map(t => ({ usdValue: t.usdValue, change24h: t.change24h })),
       ];
       change24h = allItems.reduce((s, i) => s + (i.usdValue / totalUsd) * i.change24h, 0);
     }
@@ -250,7 +256,7 @@ export async function POST(req: NextRequest) {
         change24h: nb.change24h, tokenCount: 0,
       });
     }
-    for (const token of allTokens) {
+    for (const token of visibleTokens) {
       if (!chainMap.has(token.chain)) {
         chainMap.set(token.chain, {
           chain: token.chain, name: CHAIN_CONFIG[token.chain].name,
@@ -268,7 +274,7 @@ export async function POST(req: NextRequest) {
     const portfolio: PortfolioData = {
       totalUsd, totalEur, change24h,
       nativeBalances,
-      tokens: allTokens.sort((a, b) => b.usdValue - a.usdValue),
+      tokens: visibleTokens.sort((a, b) => b.usdValue - a.usdValue),
       chains: Array.from(chainMap.values()).sort((a, b) => b.totalUsd - a.totalUsd),
       lastUpdated: Math.floor(Date.now() / 1000),
     };
